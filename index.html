@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>指尖魔法 (Fingertip Magic) - 藏文版</title>
+  <style>
+    body { 
+      margin: 0; 
+      padding: 0; 
+      background-color: #000; 
+      overflow: hidden; 
+      font-family: 'Microsoft Himalaya', 'Tibetan Machine Uni', 'Noto Sans Tibetan', 'Arial', sans-serif;
+      user-select: none;
+    }
+
+    #canvas-container {
+      width: 100vw;
+      height: 100vh;
+      position: absolute;
+      top: 0;
+      left: 0;
+      z-index: 1;
+    }
+
+    /* 必须设置 opacity 为 0 隐藏，但不能 display: none */
+    #webcam {
+      position: absolute;
+      top: 0;
+      left: 0;
+      opacity: 0; 
+      pointer-events: none;
+      z-index: -1;
+    }
+    
+    #fullscreen-btn {
+      position: absolute;
+      top: 20px;
+      right: 20px;
+      background: rgba(255, 255, 255, 0.2);
+      border: 1px solid rgba(255, 255, 255, 0.4);
+      color: #fff;
+      padding: 8px 16px;
+      cursor: pointer;
+      z-index: 100;
+      border-radius: 20px;
+      backdrop-filter: blur(8px);
+      transition: all 0.3s ease;
+      font-size: 12px;
+      outline: none;
+      font-weight: bold;
+      box-shadow: 0 0 10px rgba(255, 255, 255, 0.2);
+    }
+    
+    #fullscreen-btn:hover {
+      background: rgba(255, 255, 255, 0.4);
+      box-shadow: 0 0 20px rgba(255, 255, 255, 0.4);
+    }
+
+    #loading {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: #00ffff;
+      font-size: 20px;
+      font-weight: bold;
+      z-index: 50;
+      pointer-events: none;
+      text-shadow: 0 0 20px #00ffff;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      transition: opacity 0.5s;
+      text-align: center;
+    }
+    
+    #error-msg {
+      color: #ff4444;
+      font-size: 14px;
+      margin-top: 10px;
+      text-shadow: none;
+    }
+  </style>
+</head>
+<body>
+
+<div id="loading">
+  正在加载魔法引擎...<br>
+  <span style="font-size:12px; opacity:0.8; color:white">Initializing Magic Engine</span>
+  <div id="error-msg"></div>
+</div>
+<button id="fullscreen-btn">全屏体验</button>
+
+<video id="webcam" autoplay playsinline muted></video>
+<div id="canvas-container"></div>
+
+<script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+      "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/+esm"
+    }
+  }
+</script>
+
+<script type="module">
+  import * as THREE from 'three';
+  import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+
+  // --- 配置常量 ---
+  const CONFIG = {
+    particleCount: 8000,   // 粒子总数
+    particleSize: 1.2,     // 粒子大小
+    camDistance: 160,      
+    balloonLimit: 60
+  };
+
+  // --- 全局变量 ---
+  let scene, camera, renderer;
+  let particlesMesh;
+  let particleTargets = [];     
+  let currentPositions = [];    
+  let decorations = []; 
+  
+  let state = {
+    gesture: -1,        
+    isBlessing: false, 
+    lastText: ""
+  };
+
+  let handLandmarker = null;
+  let video = document.getElementById('webcam');
+  let lastVideoTime = -1;
+  let isVideoPlaying = false;
+
+  // 用于生成文字的离屏Canvas
+  const textCanvas = document.createElement('canvas');
+  const textCtx = textCanvas.getContext('2d');
+  textCanvas.width = 800;
+  textCanvas.height = 500;
+
+  // --- 主入口 ---
+  initScene();
+  initMediaPipe();
+
+  // --- 1. Three.js 场景初始化 ---
+  function initScene() {
+    const container = document.getElementById('canvas-container');
+    
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000); 
+    scene.fog = new THREE.FogExp2(0x000000, 0.001);
+
+    camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 1000);
+    camera.position.z = CONFIG.camDistance;
+
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    container.appendChild(renderer.domElement);
+
+    const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 1.2);
+    scene.add(hemiLight);
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+    dirLight.position.set(10, 20, 10);
+    scene.add(dirLight);
+
+    createParticles();
+
+    window.addEventListener('resize', onWindowResize);
+    document.getElementById('fullscreen-btn').addEventListener('click', toggleFullscreen);
+
+    animate();
+  }
+
+  function createParticles() {
+    const geometry = new THREE.BufferGeometry();
+    const positions = new Float32Array(CONFIG.particleCount * 3);
+    const colors = new Float32Array(CONFIG.particleCount * 3);
+    
+    const baseColor = new THREE.Color();
+
+    for (let i = 0; i < CONFIG.particleCount; i++) {
+      const x = (Math.random() - 0.5) * 600;
+      const y = (Math.random() - 0.5) * 600;
+      const z = (Math.random() - 0.5) * 300;
+
+      positions[i * 3] = x;
+      positions[i * 3 + 1] = y;
+      positions[i * 3 + 2] = z;
+
+      baseColor.setHSL(0.5 + Math.random() * 0.1, 1.0, 0.6);
+      colors[i * 3] = baseColor.r;
+      colors[i * 3 + 1] = baseColor.g;
+      colors[i * 3 + 2] = baseColor.b;
+
+      currentPositions.push(new THREE.Vector3(x, y, z));
+      particleTargets.push(new THREE.Vector3(x, y, z));
+    }
+
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+    const material = new THREE.PointsMaterial({
+      size: CONFIG.particleSize,
+      vertexColors: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      transparent: true,
+      opacity: 1.0,
+      map: createStrongGlowTexture()
+    });
+
+    particlesMesh = new THREE.Points(geometry, material);
+    scene.add(particlesMesh);
+  }
+
+  function createStrongGlowTexture() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 32;
+    canvas.height = 32;
+    const ctx = canvas.getContext('2d');
+    
+    const grad = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+    grad.addColorStop(0, 'rgba(255, 255, 255, 1)'); 
+    grad.addColorStop(0.4, 'rgba(255, 255, 255, 0.8)');
+    grad.addColorStop(0.6, 'rgba(255, 255, 255, 0.2)');
+    grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 32, 32);
+    
+    const texture = new THREE.Texture(canvas);
+    texture.needsUpdate = true;
+    return texture;
+  }
+
+  // --- 2. 文字生成逻辑 ---
+  function updateTextContent(text, isBlessingMode) {
+    if (text === state.lastText && text !== "") return;
+    state.lastText = text;
+
+    if (text === "") {
+        resetParticlesToRandom();
+        return;
+    }
+
+    textCtx.clearRect(0, 0, textCanvas.width, textCanvas.height);
+    textCtx.fillStyle = '#FFFFFF'; 
+    textCtx.textAlign = 'center';
+    textCtx.textBaseline = 'middle';
+    
+    // 单字符数字用超大字体
+    const fontSize = text.length > 5 ? 120 : 300; 
+    textCtx.font = `900 ${fontSize}px "Microsoft Himalaya", "Tibetan Machine Uni", "Noto Sans Tibetan", sans-serif`;
+    
+    const lines = text.split('\n');
+    const lineHeight = fontSize * 1.1; 
+    const startY = textCanvas.height / 2 - ((lines.length - 1) * lineHeight) / 2;
+
+    lines.forEach((line, index) => {
+        textCtx.fillText(line, textCanvas.width / 2, startY + index * lineHeight);
+    });
+
+    const imageData = textCtx.getImageData(0, 0, textCanvas.width, textCanvas.height);
+    const data = imageData.data;
+    const validPositions = [];
+
+    const step = 2; 
+
+    for (let y = 0; y < textCanvas.height; y += step) {
+        for (let x = 0; x < textCanvas.width; x += step) {
+            const index = (y * textCanvas.width + x) * 4;
+            if (data[index + 3] > 100) { 
+                validPositions.push({
+                    x: (x - textCanvas.width / 2) * 0.4, 
+                    y: -(y - textCanvas.height / 2) * 0.4
+                });
+            }
+        }
+    }
+
+    const colorAttribute = particlesMesh.geometry.attributes.color;
+    const tempColor = new THREE.Color();
+    
+    for (let i = 0; i < CONFIG.particleCount; i++) {
+        const target = particleTargets[i];
+        
+        if (validPositions.length > 0) {
+            let posIndex = i % validPositions.length;
+            if (i > validPositions.length) posIndex = Math.floor(Math.random() * validPositions.length);
+            
+            const pos = validPositions[posIndex];
+            target.set(pos.x, pos.y, (Math.random() - 0.5) * 5);
+            
+            // 5指模式的光环
+            if (isBlessingMode && i > validPositions.length * 1.5) {
+                const angle = Math.random() * Math.PI * 2;
+                const r = 90 + Math.random() * 30;
+                target.set(
+                    Math.cos(angle) * r,
+                    Math.sin(angle) * r,
+                    (Math.random() - 0.5) * 40
+                );
+            }
+        } else {
+            target.set((Math.random()-0.5)*200, (Math.random()-0.5)*200, 0);
+        }
+
+        // --- 颜色配置 ---
+        if (isBlessingMode) {
+            // 金色系 (5指)
+            tempColor.setHSL(0.08 + Math.random() * 0.08, 1.0, 0.5 + Math.random() * 0.4);
+        } else {
+            // 青蓝系 (1-4指)
+            tempColor.setHSL(0.5 + Math.random() * 0.1, 1.0, 0.6 + Math.random() * 0.3);
+        }
+        
+        colorAttribute.setXYZ(i, tempColor.r, tempColor.g, tempColor.b);
+    }
+    
+    colorAttribute.needsUpdate = true;
+  }
+
+  function resetParticlesToRandom() {
+    const tempColor = new THREE.Color();
+    for (let i = 0; i < CONFIG.particleCount; i++) {
+        particleTargets[i].set(
+            (Math.random() - 0.5) * 600,
+            (Math.random() - 0.5) * 600,
+            (Math.random() - 0.5) * 300
+        );
+        
+        // 待机暗色
+        tempColor.setHSL(0.6, 0.8, 0.2 + Math.random() * 0.3);
+        const colorAttribute = particlesMesh.geometry.attributes.color;
+        colorAttribute.setXYZ(i, tempColor.r, tempColor.g, tempColor.b);
+    }
+    particlesMesh.geometry.attributes.color.needsUpdate = true;
+  }
+
+  // --- 3. 装饰物特效 ---
+  function spawnBlessingDecorations() {
+    if (decorations.length > CONFIG.balloonLimit) return;
+    if (Math.random() > 0.05) return; 
+
+    const isBalloon = Math.random() > 0.3;
+    let mesh;
+    
+    if (isBalloon) {
+        const geo = new THREE.SphereGeometry(3, 32, 32); 
+        const mat = new THREE.MeshPhongMaterial({
+            color: new THREE.Color().setHSL(Math.random(), 0.9, 0.6), 
+            shininess: 150,
+            specular: 0x444444
+        });
+        mesh = new THREE.Mesh(geo, mat);
+        
+        const lineGeo = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(0, -3, 0), new THREE.Vector3(0, -12, 0)
+        ]);
+        const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({color: 0xffffff, transparent: true, opacity: 0.5}));
+        mesh.add(line);
+    } else {
+        const geo = new THREE.PlaneGeometry(2.5, 2.5);
+        const mat = new THREE.MeshBasicMaterial({
+            color: new THREE.Color().setHSL(Math.random() * 0.15, 1.0, 0.7), 
+            side: THREE.DoubleSide,
+            transparent: true,
+            opacity: 0.9
+        });
+        mesh = new THREE.Mesh(geo, mat);
+        mesh.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, 0);
+    }
+
+    mesh.position.set(
+        (Math.random() - 0.5) * 250, 
+        -120 - Math.random() * 50,    
+        (Math.random() - 0.5) * 80     
+    );
+
+    mesh.userData = {
+        speed: 0.3 + Math.random() * 0.4,
+        rotSpeed: (Math.random() - 0.5) * 0.1
+    };
+
+    scene.add(mesh);
+    decorations.push(mesh);
+  }
+
+  function clearDecorations() {
+    decorations.forEach(d => {
+        scene.remove(d);
+        if (d.geometry) d.geometry.dispose();
+        if (d.material) d.material.dispose();
+    });
+    decorations = [];
+  }
+
+  function animate() {
+    requestAnimationFrame(animate);
+
+    const time = Date.now();
+    const positions = particlesMesh.geometry.attributes.position;
+    const lerpFactor = state.isBlessing ? 0.1 : 0.15;
+
+    for (let i = 0; i < CONFIG.particleCount; i++) {
+      const current = currentPositions[i];
+      const target = particleTargets[i];
+
+      const noiseX = Math.sin(time * 0.002 + i * 0.02) * 0.1;
+      const noiseY = Math.cos(time * 0.003 + i * 0.02) * 0.1;
+
+      current.x += (target.x - current.x) * lerpFactor + noiseX;
+      current.y += (target.y - current.y) * lerpFactor + noiseY;
+      current.z += (target.z - current.z) * lerpFactor;
+
+      positions.setXYZ(i, current.x, current.y, current.z);
+    }
+    positions.needsUpdate = true;
+
+    if (state.isBlessing) {
+        spawnBlessingDecorations();
+    }
+    
+    for (let i = decorations.length - 1; i >= 0; i--) {
+        const d = decorations[i];
+        d.position.y += d.userData.speed;
+        if (d.userData.rotSpeed) {
+             d.rotation.x += d.userData.rotSpeed;
+             d.rotation.y += d.userData.rotSpeed;
+             d.rotation.z += d.userData.rotSpeed;
+        }
+        
+        if (d.position.y > 120) {
+            scene.remove(d);
+            decorations.splice(i, 1);
+            d.geometry.dispose();
+            d.material.dispose();
+        }
+    }
+
+    renderer.render(scene, camera);
+  }
+
+  // --- 5. MediaPipe ---
+  async function initMediaPipe() {
+    const errorMsg = document.getElementById('error-msg');
+    try {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+      );
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 1
+      });
+      
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+          navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } })
+          .then((stream) => {
+              video.srcObject = stream;
+              video.addEventListener('loadeddata', () => {
+                  isVideoPlaying = true;
+                  // 移除加载提示
+                  const loader = document.getElementById('loading');
+                  if(loader) loader.style.display = 'none';
+                  predictWebcam();
+              });
+          })
+          .catch((err) => {
+              console.error(err);
+              errorMsg.innerHTML = "摄像头权限被拒绝，请允许浏览器使用摄像头。";
+          });
+      } else {
+          errorMsg.innerHTML = "当前环境不支持调用摄像头（请勿直接双击打开，需用本地服务器运行）。";
+      }
+    } catch (error) {
+      console.error("模型加载失败:", error);
+      errorMsg.innerHTML = "模型下载失败！如果开了VPN还是不行，请尝试更换节点，或者下载模型文件到本地。";
+    }
+  }
+
+  async function predictWebcam() {
+    if (handLandmarker && isVideoPlaying) {
+        let startTimeMs = performance.now();
+        if (lastVideoTime !== video.currentTime) {
+            lastVideoTime = video.currentTime;
+            const results = handLandmarker.detectForVideo(video, startTimeMs);
+            
+            if (results.landmarks && results.landmarks.length > 0) {
+                const landmarks = results.landmarks[0];
+                const fingers = countFingers(landmarks);
+                handleGesture(fingers);
+            }
+        }
+    }
+    requestAnimationFrame(predictWebcam);
+  }
+
+  function countFingers(landmarks) {
+    let count = 0;
+    const dist = (p1, p2) => Math.sqrt(Math.pow(p1.x-p2.x,2) + Math.pow(p1.y-p2.y,2));
+    if (dist(landmarks[4], landmarks[17]) > dist(landmarks[2], landmarks[17]) * 1.2) {
+        count++;
+    }
+    if (landmarks[8].y < landmarks[6].y) count++;  
+    if (landmarks[12].y < landmarks[10].y) count++; 
+    if (landmarks[16].y < landmarks[14].y) count++; 
+    if (landmarks[20].y < landmarks[18].y) count++; 
+
+    return count;
+  }
+
+  function handleGesture(fingers) {
+    if (fingers === 0) {
+        if (state.gesture !== 0) {
+            state.gesture = 0;
+            state.isBlessing = false;
+            updateTextContent("", false); 
+            clearDecorations(); 
+        }
+    } else if (fingers === 1) {
+        if (state.gesture !== 1) {
+            state.gesture = 1;
+            state.isBlessing = false;
+            updateTextContent("༡", false);
+            clearDecorations();
+        }
+    } else if (fingers === 2) {
+        if (state.gesture !== 2) {
+            state.gesture = 2;
+            state.isBlessing = false;
+            updateTextContent("༢", false);
+            clearDecorations();
+        }
+    } else if (fingers === 3) {
+        if (state.gesture !== 3) {
+            state.gesture = 3;
+            state.isBlessing = false;
+            updateTextContent("༣", false);
+            clearDecorations();
+        }
+    } else if (fingers === 4) {
+        if (state.gesture !== 4) {
+            state.gesture = 4;
+            state.isBlessing = false;
+            updateTextContent("༤", false); // 藏文 4
+            clearDecorations();
+        }
+    } else if (fingers === 5) {
+        if (state.gesture !== 5) {
+            state.gesture = 5;
+            state.isBlessing = true; // 保持特效
+            updateTextContent("བཀྲ་ཤིས་\nབདེ་ལེགས།", true); // 还原为藏语祝福
+        }
+    }
+  }
+
+  function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  function toggleFullscreen() {
+    if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(err => {
+            console.warn("Fullscreen unavailable:", err);
+        });
+    } else {
+        if (document.exitFullscreen) {
+            document.exitFullscreen().catch(err => {
+                 console.warn("Exit Fullscreen error:", err);
+            });
+        }
+    }
+  }
+</script>
+</body>
+</html>
